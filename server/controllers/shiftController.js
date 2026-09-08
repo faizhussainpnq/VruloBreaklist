@@ -1,4 +1,4 @@
-const User = require('../models/User');
+const User = require('../models/user.js');
 const d = () => new Date().toISOString().split('T')[0];
 const t = () => new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
