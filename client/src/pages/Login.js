@@ -22,7 +22,9 @@ function Login() {
 
     // Optional Static Admin Override
     if (loginInput.toLowerCase() === "admin" && password === "admin123") {
-      return navigate("/admin");
+      setLoading(true);
+      setTimeout(() => navigate("/admin"), 800);
+      return;
     }
 
     setLoading(true);
@@ -50,13 +52,20 @@ function Login() {
         localStorage.setItem("user", JSON.stringify(data.user));
       }
 
-      // Backend se jo redirect route mil rha hai uspar navigate karein
-      navigate(data.redirectTo || "/employee");
+      // Smooth delay before redirecting for luxury loading feel
+      setTimeout(() => {
+        navigate(data.redirectTo || "/employee");
+      }, 800);
+
     } catch (err) {
-      setError(err.message);
+      // Enhanced descriptive error handling based on failure type
+      let errorMessage = err.message;
+      if (err.message === "Failed to fetch" || err.name === "TypeError") {
+        errorMessage = "Server is waking up or unavailable. Please check your network connection and try again.";
+      }
+      setError(errorMessage);
       setShake(true);
       setTimeout(() => setShake(false), 500);
-    } finally {
       setLoading(false);
     }
   };
@@ -64,6 +73,46 @@ function Login() {
   return (
     <div className="min-h-screen relative flex items-center justify-center p-4 overflow-hidden">
       <StarBackground />
+
+      {/* Expensive Full-Screen Luxury Loader Overlay */}
+      <AnimatePresence>
+        {loading && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 backdrop-blur-xl bg-slate-950/80 flex flex-col items-center justify-center"
+          >
+            <motion.div
+              initial={{ scale: 0.5, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              transition={{ duration: 0.4, ease: "easeOut" }}
+              className="relative flex flex-col items-center p-8 rounded-3xl bg-slate-900/40 border border-amber-500/30 shadow-[0_0_80px_rgba(245,158,11,0.25)]"
+            >
+              <div className="absolute inset-0 rounded-3xl bg-amber-400/10 blur-2xl animate-pulse" />
+              
+              {/* Spinning Luxury Ring with Logo */}
+              <div className="relative w-20 h-20 mb-6 flex items-center justify-center">
+                <motion.div
+                  animate={{ rotate: 360 }}
+                  transition={{ repeat: Infinity, duration: 1.5, ease: "linear" }}
+                  className="absolute inset-0 rounded-full border-2 border-transparent border-t-amber-400 border-r-amber-400/50 shadow-[0_0_15px_rgba(245,158,11,0.5)]"
+                />
+                <img
+                  src={Logo}
+                  alt="Vrulo Logo"
+                  className="w-10 h-10 object-contain relative z-10 drop-shadow-[0_0_10px_rgba(251,191,36,0.8)]"
+                />
+              </div>
+
+              <h2 className="text-xl font-bold text-white tracking-wide mb-1">Authenticating</h2>
+              <p className="text-amber-400/80 text-xs tracking-widest uppercase font-medium animate-pulse">
+                Please wait, entering workspace...
+              </p>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <motion.div
         animate={shake ? { x: [-12, 12, -8, 8, 0] } : {}}
