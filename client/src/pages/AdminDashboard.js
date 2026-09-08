@@ -14,7 +14,8 @@ import {
   FaUserPlus,
   FaEye,
   FaEyeSlash,
-  FaCheckCircle
+  FaCheckCircle,
+  FaRedo
 } from "react-icons/fa";
 import StarBackground from "../components/StarBackground";
 import Navbar from "../components/Navbar";
@@ -28,6 +29,102 @@ import {
   todayDateString,
   formatCountdown
 } from "../utils/ShiftUtils";
+
+// NEW: Reusable spinning-ring loader. Pass `size` (px) and optional className
+// for color (uses currentColor so parent text-color controls it).
+const Spinner = ({ size = 20, className = "" }) => (
+  <svg
+    className={`animate-spin ${className}`}
+    style={{ width: size, height: size }}
+    viewBox="0 0 24 24"
+    fill="none"
+    aria-hidden="true"
+  >
+    <circle
+      className="opacity-25"
+      cx="12"
+      cy="12"
+      r="10"
+      stroke="currentColor"
+      strokeWidth="3.5"
+    />
+    <path
+      className="opacity-90"
+      d="M12 2a10 10 0 0 1 10 10"
+      stroke="currentColor"
+      strokeWidth="3.5"
+      strokeLinecap="round"
+    />
+  </svg>
+);
+
+// NEW: Full-page loading overlay — big glowing ring, blurred backdrop.
+// Used whenever employees are being fetched, so it genuinely feels like
+// the whole page is loading rather than just a table row.
+const FullPageLoader = ({ label = "Loading employees...", darkMode }) => (
+  <motion.div
+    initial={{ opacity: 0 }}
+    animate={{ opacity: 1 }}
+    exit={{ opacity: 0 }}
+    className={`fixed inset-0 z-[70] flex flex-col items-center justify-center gap-5 backdrop-blur-sm ${
+      darkMode ? "bg-slate-950/80" : "bg-slate-100/80"
+    }`}
+  >
+    <div className="relative w-20 h-20 flex items-center justify-center">
+      <div
+        className={`absolute inset-0 rounded-full border-4 ${
+          darkMode ? "border-slate-800" : "border-slate-300"
+        }`}
+      />
+      <div className="absolute inset-0 rounded-full border-4 border-amber-400 border-t-transparent animate-spin shadow-[0_0_20px_rgba(251,191,36,0.4)]" />
+      <div className="absolute inset-2 rounded-full border-2 border-amber-400/30 border-b-transparent animate-spin [animation-direction:reverse] [animation-duration:1.2s]" />
+    </div>
+    <p className={`text-sm font-bold animate-pulse tracking-wide ${darkMode ? "text-slate-200" : "text-slate-700"}`}>
+      {label}
+    </p>
+  </motion.div>
+);
+
+// NEW: Centered "action in progress" overlay — used for delete / save /
+// register instead of a spinner crammed inside the button. Sits ABOVE the
+// modals (z-[80]) so it dims the whole screen including whichever form
+// triggered it, feels premium instead of "beech me loading" ugliness.
+const ActionOverlay = ({ show, label = "Working on it...", darkMode }) => (
+  <AnimatePresence>
+    {show && (
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-[3px]"
+      >
+        <motion.div
+          initial={{ opacity: 0, scale: 0.85, y: 12 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          exit={{ opacity: 0, scale: 0.9, y: 8 }}
+          transition={{ type: "spring", stiffness: 260, damping: 22 }}
+          className={`flex flex-col items-center gap-4 px-10 py-8 rounded-3xl border shadow-2xl ${
+            darkMode
+              ? "bg-slate-900/95 border-slate-800"
+              : "bg-white/95 border-slate-200"
+          }`}
+        >
+          <div className="relative w-14 h-14 flex items-center justify-center">
+            <div
+              className={`absolute inset-0 rounded-full border-4 ${
+                darkMode ? "border-slate-800" : "border-slate-200"
+              }`}
+            />
+            <div className="absolute inset-0 rounded-full border-4 border-amber-400 border-t-transparent animate-spin shadow-[0_0_18px_rgba(251,191,36,0.45)]" />
+          </div>
+          <p className={`text-xs font-extrabold tracking-wide animate-pulse ${darkMode ? "text-slate-200" : "text-slate-700"}`}>
+            {label}
+          </p>
+        </motion.div>
+      </motion.div>
+    )}
+  </AnimatePresence>
+);
 
 export default function AdminDashboard() {
   const navigate = useNavigate();
@@ -50,6 +147,18 @@ export default function AdminDashboard() {
   // Registration Success Banner State
   const [successMessage, setSuccessMessage] = useState("");
 
+  // Non-blocking error banner (replaces alert() for a cleaner UX)
+  const [actionError, setActionError] = useState("");
+
+  // Loading flags for in-flight actions (prevents double-submits, drives the
+  // centered ActionOverlay instead of a spinner glued inside the button)
+  const [isRegistering, setIsRegistering] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  // Track fetch-users error separately so we can show a Retry state
+  const [usersError, setUsersError] = useState("");
+
   // Register Form State
   const [newEmployee, setNewEmployee] = useState({
     name: "",
@@ -71,6 +180,50 @@ export default function AdminDashboard() {
     const interval = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(interval);
   }, []);
+
+  // Shows a temporary error banner instead of a blocking alert()
+  const showError = (message) => {
+    setActionError(message);
+    setTimeout(() => setActionError(""), 4000);
+  };
+
+  // Detects whether a raw user record from the API is the admin account,
+  // so admin never shows up in the employee table.
+  // Adjust the field names below if your backend uses different keys.
+  const isAdminRecord = (user) => {
+    if (!user) return false;
+    const role = (user.role || user.userType || user.type || user.accountType || "")
+      .toString()
+      .toLowerCase();
+    if (role === "admin" || role === "administrator") return true;
+    if (user.isAdmin === true || user.admin === true) return true;
+    const empId = (user.employeeId || user.empId || "").toString().toLowerCase();
+    if (empId === "admin") return true;
+    return false;
+  };
+
+  // Wraps fetch with a timeout so a hung/slow server doesn't freeze the UI
+  const fetchWithTimeout = async (url, options = {}, timeoutMs = 15000) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      return response;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  // Turns a raw error into a friendly, specific message
+  const describeError = (error, fallback) => {
+    if (error?.name === "AbortError") {
+      return "Request timed out. Please check your connection and try again.";
+    }
+    if (error instanceof TypeError) {
+      return "Couldn't reach the server. Check your internet connection or try again shortly.";
+    }
+    return error?.message || fallback;
+  };
 
   const normalizeUser = (user) => {
   const shifts = Array.isArray(user.shifts) ? user.shifts : [];
@@ -109,13 +262,19 @@ export default function AdminDashboard() {
   const getUsers = async () => {
     try {
       setLoadingUsers(true);
+      setUsersError("");
 
-      const response = await fetch(`${API_URL}api/users`, {
+      const response = await fetchWithTimeout(`${API_URL}api/users`, {
         method: "GET",
         headers: { Accept: "application/json" }
       });
 
-      const data = await response.json().catch(() => ({}));
+      let data = {};
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error("Server sent an invalid response. Please try again.");
+      }
 
       if (!response.ok) {
         throw new Error(data.message || `Failed to fetch users (${response.status})`);
@@ -131,10 +290,13 @@ export default function AdminDashboard() {
               ? data.results
               : [];
 
-      setEmployees(users.map(normalizeUser));
+      // Exclude the admin account from the employee list
+      const nonAdminUsers = users.filter((u) => !isAdminRecord(u));
+
+      setEmployees(nonAdminUsers.map(normalizeUser));
     } catch (error) {
       console.error("GET USERS ERROR:", error);
-      alert(`Users fetch error: ${error.message}`);
+      setUsersError(describeError(error, "Something went wrong while loading employees."));
     } finally {
       setLoadingUsers(false);
     }
@@ -183,12 +345,19 @@ export default function AdminDashboard() {
     if (!deletingEmployee?.id) return;
 
     try {
-      const response = await fetch(`${API_URL}api/users/delete/${deletingEmployee.id}`, {
+      setIsDeleting(true);
+
+      const response = await fetchWithTimeout(`${API_URL}api/users/delete/${deletingEmployee.id}`, {
         method: "DELETE",
         headers: { Accept: "application/json" }
       });
 
-      const data = await response.json().catch(() => ({}));
+      let data = {};
+      try {
+        data = await response.json();
+      } catch {
+        // some delete endpoints return no body — that's fine
+      }
 
       if (!response.ok) {
         throw new Error(data.message || `Delete failed (${response.status})`);
@@ -200,7 +369,9 @@ export default function AdminDashboard() {
       setTimeout(() => setSuccessMessage(""), 2000);
     } catch (error) {
       console.error("DELETE USER ERROR:", error);
-      alert(`Delete error: ${error.message}`);
+      showError(describeError(error, "Couldn't delete this employee. Please try again."));
+    } finally {
+      setIsDeleting(false);
     }
   };
 
@@ -210,6 +381,8 @@ export default function AdminDashboard() {
   if (!editingEmployee?.id) return;
 
   try {
+    setIsSaving(true);
+
     // Local today's date
     const today = todayDateString();
 
@@ -228,7 +401,7 @@ export default function AdminDashboard() {
 
     console.log("UPDATE PAYLOAD:", payload);
 
-    const response = await fetch(
+    const response = await fetchWithTimeout(
       `${API_URL}api/users/update/${editingEmployee.id}`,
       {
         method: "PUT",
@@ -240,7 +413,12 @@ export default function AdminDashboard() {
       }
     );
 
-    const data = await response.json().catch(() => ({}));
+    let data = {};
+    try {
+      data = await response.json();
+    } catch {
+      throw new Error("Server sent an invalid response. Please try again.");
+    }
 
     console.log("UPDATE RESPONSE:", data);
 
@@ -263,21 +441,30 @@ export default function AdminDashboard() {
 
   } catch (error) {
     console.error("UPDATE USER ERROR:", error);
-    alert(`Update error: ${error.message}`);
+    showError(describeError(error, "Couldn't save changes. Please try again."));
+  } finally {
+    setIsSaving(false);
   }
 };
 
   const handleRegisterEmployee = async (e) => {
     e.preventDefault();
 
+    if (!newEmployee.name.trim() || !newEmployee.empId.trim() || !newEmployee.password) {
+      showError("Please fill in name, employee ID and password.");
+      return;
+    }
+
     try {
+      setIsRegistering(true);
+
       const payload = {
         name: newEmployee.name.trim(),
         employeeId: newEmployee.empId.trim(),
         password: newEmployee.password
       };
 
-      const response = await fetch(`${API_URL}api/users/register`, {
+      const response = await fetchWithTimeout(`${API_URL}api/users/register`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -286,7 +473,12 @@ export default function AdminDashboard() {
         body: JSON.stringify(payload)
       });
 
-      const data = await response.json().catch(() => ({}));
+      let data = {};
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error("Server sent an invalid response. Please try again.");
+      }
 
       if (!response.ok) {
         throw new Error(data.message || `Registration failed (${response.status})`);
@@ -296,7 +488,12 @@ export default function AdminDashboard() {
 
       // Backend response agar user object na bhi de, registration ke baad
       // complete fresh list GET karke table ko sync kar denge.
-      if (registeredUser && (registeredUser._id || registeredUser.id)) {
+      // Also make sure we never accidentally add the admin account itself.
+      if (
+        registeredUser &&
+        !isAdminRecord(registeredUser) &&
+        (registeredUser._id || registeredUser.id)
+      ) {
         setEmployees((prev) => [normalizeUser(registeredUser), ...prev]);
       } else {
         await getUsers();
@@ -322,7 +519,9 @@ export default function AdminDashboard() {
       }, 2000);
     } catch (error) {
       console.error("REGISTER USER ERROR:", error);
-      alert(`Registration error: ${error.message}`);
+      showError(describeError(error, "Couldn't register this employee. Please try again."));
+    } finally {
+      setIsRegistering(false);
     }
   };
 
@@ -364,11 +563,37 @@ export default function AdminDashboard() {
     return { ...slice, pathData, percent: Math.round(percent * 100) };
   });
 
+  // Single source of truth for what the ActionOverlay currently shows —
+  // whichever action is in-flight wins (only one can be true at a time in
+  // normal usage, but this keeps precedence sane if that ever changes).
+  const actionOverlayLabel = isDeleting
+    ? "Deleting employee..."
+    : isSaving
+      ? "Saving changes..."
+      : isRegistering
+        ? "Registering employee..."
+        : "";
+  const isActionInFlight = isDeleting || isSaving || isRegistering;
+
   return (
     <div className={`h-screen w-full overflow-y-auto overflow-x-hidden font-sans flex flex-col transition-colors duration-300 ${
       darkMode ? "bg-slate-950 text-slate-100" : "bg-slate-50 text-slate-900"
     }`}>
       {darkMode && <StarBackground />}
+
+      {/* NEW: Full-page loader while employees are being fetched (initial load AND retries) */}
+      <AnimatePresence>
+        {loadingUsers && (
+          <FullPageLoader
+            darkMode={darkMode}
+            label={employees.length === 0 ? "Loading employee data..." : "Refreshing employee data..."}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* NEW: Centered overlay for delete / save / register — replaces the
+          old in-button spinner+text swap so nothing feels cramped. */}
+      <ActionOverlay show={isActionInFlight} label={actionOverlayLabel} darkMode={darkMode} />
 
       <Navbar 
         role="Admin" 
@@ -390,6 +615,21 @@ export default function AdminDashboard() {
             >
               <FaCheckCircle className="text-base shrink-0" />
               <span>{successMessage}</span>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Non-blocking error banner (replaces alert()) */}
+        <AnimatePresence>
+          {actionError && (
+            <motion.div 
+              initial={{ opacity: 0, y: -20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="flex items-center gap-3 p-4 rounded-2xl bg-rose-500 text-white font-extrabold text-xs shadow-xl shadow-rose-500/20"
+            >
+              <FaExclamationTriangle className="text-base shrink-0" />
+              <span>{actionError}</span>
             </motion.div>
           )}
         </AnimatePresence>
@@ -601,9 +841,23 @@ export default function AdminDashboard() {
               </thead>
               <tbody className="divide-y divide-slate-800/20 text-sm">
                 {loadingUsers ? (
+                  // The FullPageLoader already covers this moment — keep the
+                  // table area empty/quiet underneath instead of duplicating text.
+                  null
+                ) : usersError ? (
                   <tr>
-                    <td colSpan="9" className="py-8 text-center text-xs text-slate-500">
-                      Loading employees...
+                    <td colSpan="9" className="py-10 text-center text-xs">
+                      <div className="flex flex-col items-center gap-3">
+                        <span className="text-rose-500 font-bold flex items-center gap-2">
+                          <FaExclamationTriangle /> {usersError}
+                        </span>
+                        <button
+                          onClick={getUsers}
+                          className="flex items-center gap-2 px-4 py-2 rounded-xl bg-amber-400 text-slate-950 font-bold text-xs hover:bg-amber-300 cursor-pointer transition-all"
+                        >
+                          <FaRedo /> Retry
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ) : filteredEmployees.map((emp) => {
@@ -719,7 +973,7 @@ export default function AdminDashboard() {
                     </tr>
                   );
                 })}
-                {!loadingUsers && filteredEmployees.length === 0 && (
+                {!loadingUsers && !usersError && filteredEmployees.length === 0 && (
                   <tr>
                     <td colSpan="9" className="py-8 text-center text-xs text-slate-500">
                       No employees found.
@@ -815,13 +1069,15 @@ export default function AdminDashboard() {
                 <button
                   type="button"
                   onClick={() => setIsRegisterModalOpen(false)}
-                  className={`px-4 py-2 rounded-xl text-xs font-bold cursor-pointer ${darkMode ? "text-slate-400" : "text-slate-600"}`}
+                  disabled={isRegistering}
+                  className={`px-4 py-2 rounded-xl text-xs font-bold cursor-pointer disabled:opacity-50 ${darkMode ? "text-slate-400" : "text-slate-600"}`}
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-xl text-xs font-bold bg-amber-400 text-slate-950 hover:bg-amber-300 transition-all shadow-lg cursor-pointer"
+                  disabled={isRegistering}
+                  className="flex items-center justify-center min-w-[150px] px-4 py-2 rounded-xl text-xs font-bold bg-amber-400 text-slate-950 hover:bg-amber-300 transition-all shadow-lg cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Register & Continue
                 </button>
@@ -910,13 +1166,15 @@ export default function AdminDashboard() {
                 <button
                   type="button"
                   onClick={() => setEditingEmployee(null)}
-                  className={`px-4 py-2 rounded-xl text-xs font-bold cursor-pointer ${darkMode ? "text-slate-400" : "text-slate-600"}`}
+                  disabled={isSaving}
+                  className={`px-4 py-2 rounded-xl text-xs font-bold cursor-pointer disabled:opacity-50 ${darkMode ? "text-slate-400" : "text-slate-600"}`}
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-xl text-xs font-bold bg-amber-400 text-slate-950 hover:bg-amber-300 transition-all shadow-lg cursor-pointer"
+                  disabled={isSaving}
+                  className="flex items-center justify-center min-w-[130px] px-4 py-2 rounded-xl text-xs font-bold bg-amber-400 text-slate-950 hover:bg-amber-300 transition-all shadow-lg cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Save Changes
                 </button>
@@ -945,13 +1203,15 @@ export default function AdminDashboard() {
               <div className="flex justify-end gap-3">
                 <button
                   onClick={() => setDeletingEmployee(null)}
-                  className={`px-4 py-2 rounded-xl text-xs font-bold cursor-pointer ${darkMode ? "text-slate-400" : "text-slate-600"}`}
+                  disabled={isDeleting}
+                  className={`px-4 py-2 rounded-xl text-xs font-bold cursor-pointer disabled:opacity-50 ${darkMode ? "text-slate-400" : "text-slate-600"}`}
                 >
                   Cancel
                 </button>
                 <button
                   onClick={confirmDeleteEmployee}
-                  className="px-4 py-2 rounded-xl text-xs font-bold bg-rose-500 text-white hover:bg-rose-600 transition-all shadow-lg cursor-pointer"
+                  disabled={isDeleting}
+                  className="flex items-center justify-center min-w-[110px] px-4 py-2 rounded-xl text-xs font-bold bg-rose-500 text-white hover:bg-rose-600 transition-all shadow-lg cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Yes, Delete
                 </button>
