@@ -259,9 +259,9 @@ export default function AdminDashboard() {
   const [employees, setEmployees] = useState([]);
   const [loadingUsers, setLoadingUsers] = useState(true);
 
-  const getUsers = async () => {
+  const getUsers = async (silent = false) => {
     try {
-      setLoadingUsers(true);
+      if (!silent) setLoadingUsers(true);
       setUsersError("");
 
       const response = await fetchWithTimeout(`${API_URL}api/users`, {
@@ -296,14 +296,27 @@ export default function AdminDashboard() {
       setEmployees(nonAdminUsers.map(normalizeUser));
     } catch (error) {
       console.error("GET USERS ERROR:", error);
-      setUsersError(describeError(error, "Something went wrong while loading employees."));
+      // Silent polling failures should not spam the error banner / table
+      if (!silent) {
+        setUsersError(describeError(error, "Something went wrong while loading employees."));
+      }
     } finally {
-      setLoadingUsers(false);
+      if (!silent) setLoadingUsers(false);
     }
   };
 
   useEffect(() => {
     getUsers();
+  }, []);
+
+  // NEW: Silently re-fetch employees every few seconds so break/shift
+  // changes made elsewhere (start shift, start/end break, etc.) show up
+  // here automatically without a manual page refresh.
+  useEffect(() => {
+    const pollInterval = setInterval(() => {
+      getUsers(true); // silent = true -> no full-page loader, no error banner spam
+    }, 5000);
+    return () => clearInterval(pollInterval);
   }, []);
 
   // Enrich every employee with today's live violation list + break status.
