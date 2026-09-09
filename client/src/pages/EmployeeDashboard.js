@@ -16,7 +16,7 @@ import {
 import StarBackground from "../components/StarBackground";
 import Navbar from "../components/Navbar";
 
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000/";
+const API_URL = import.meta.env.VITE_API_URL || "https://vrulobreaklist-1.onrender.com/";
 
 function EmployeeDashboard() {
   const navigate = useNavigate();
