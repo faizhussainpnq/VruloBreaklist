@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { startShift, endShift, startBreak, endBreak } = require('../controllers/shiftController');
+const { startShift, endShift, startBreak, endBreak } = require('../controllers/shiftController.js');
 
 router.post('/start/:id', startShift);
 router.post('/end/:id', endShift);

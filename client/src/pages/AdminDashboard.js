@@ -171,7 +171,7 @@ export default function AdminDashboard() {
     violations: 0
   });
 
-  const API_URL = (import.meta.env.VITE_API_URL || "https://vrulobreaklist-1.onrender.com/")
+  const API_URL = (import.meta.env.VITE_API_URL || "http://localhost:5000/")
 
   // Ticks every second so "on break" shows a live running countdown and
   // today's violations stay current, without needing a page refresh.

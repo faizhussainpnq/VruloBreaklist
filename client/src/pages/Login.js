@@ -14,7 +14,7 @@ function Login() {
   const [loading, setLoading] = useState(false);
   const [shake, setShake] = useState(false);
 
-  const API_URL = import.meta.env.VITE_API_URL || "https://vrulobreaklist-1.onrender.com/";
+  const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000/";
 
   const handleLogin = async (e) => {
     e.preventDefault();
