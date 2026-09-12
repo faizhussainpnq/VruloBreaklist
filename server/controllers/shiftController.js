@@ -1,8 +1,5 @@
 const User = require('../models/user.js');
 
-// Sab kuch IST (Asia/Kolkata) mein calculate karo taaki server ke timezone
-// (cloud hosts UTC pe chalte hain) par depend na kare. UTC hone ki wajah se hi
-// 10 AM IST ki jagah 4:30 AM store ho raha tha.
 const TZ = 'Asia/Kolkata';
 
 // en-CA -> "YYYY-MM-DD" format, IST calendar day ke hisaab se stable date key.
@@ -14,6 +11,7 @@ const t = () =>
     timeZone: TZ,
     hour: '2-digit',
     minute: '2-digit',
+    second: '2-digit',
     hour12: true,
   });
 
@@ -73,3 +71,24 @@ exports.endBreak = async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 };
+
+exports.updateBreak = async (req, res) => {
+  const u = await User.findById(req.params.id);
+  const s = u.shifts.id(req.body.shiftId);
+  const b = s.breaks.id(req.params.breakId);
+  if(req.body.start) b.start = req.body.start;
+  if(req.body.end !== undefined) b.end = req.body.end;
+  await u.save();
+  res.json({ success: true, data: u });
+};
+
+
+// shiftController.js mein ye add karein:
+exports.deleteBreak = async (req, res) => {
+  const u = await User.findById(req.params.id);
+  const s = u.shifts.id(req.body.shiftId);
+  s.breaks.pull(req.params.breakId);
+  await u.save();
+  res.json({ success: true, data: u });
+};
+

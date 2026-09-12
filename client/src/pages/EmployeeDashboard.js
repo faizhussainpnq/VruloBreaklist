@@ -17,7 +17,7 @@ import {
 import StarBackground from "../components/StarBackground";
 import Navbar from "../components/Navbar";
 
-const API_URL = import.meta.env.VITE_API_URL || "https://vrulobreaklist-1.onrender.com/";
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000/";
 
 const BREAK_LABELS = {
   break1: "Short Break 1",
@@ -52,6 +52,20 @@ function parseTimeStringToDate(timeStr, baseDate) {
   const d = baseDate ? new Date(baseDate) : new Date();
   d.setHours(hours, minutes, seconds, 0);
   return d;
+}
+
+// FIX: uses the browser's LOCAL date (year-month-day), not UTC. The old
+// code used `new Date().toISOString().split("T")[0]`, which is UTC — for
+// timezones like India (UTC+5:30) this can point to a different calendar
+// date than "today" for part of the day. That mismatch is why, after
+// starting a shift, a page refresh sometimes couldn't find "today's" shift
+// record (it was looking for the wrong date) and wrongly showed the
+// "Start Shift" button again until a fresh login happened to land on a
+// moment where the dates lined up. Every other part of the app (admin
+// panel, shiftUtils) already uses the local date — this makes the
+// employee dashboard consistent with that.
+function localTodayDateString(d = new Date()) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
 function formatClock(date) {
@@ -425,7 +439,10 @@ function EmployeeDashboard() {
   // app/browser window — so the countdown appeared "stuck" until the tab
   // became active again. This version is self-correcting: no matter how
   // long the tab was hidden, the instant it's visible again the remaining
-  // time is recomputed from scratch and is always accurate.
+  // time is recomputed from scratch and is always accurate. It also means
+  // that when the periodic sync below updates activeBreakStartTime (e.g.
+  // because the admin edited this break's start time), the countdown
+  // instantly reflects the corrected time.
   useEffect(() => {
     if (!onBreak || !activeBreakStartTime) return;
 
@@ -525,97 +542,182 @@ function EmployeeDashboard() {
     return { isEarlyEnd: false, text: "Shift Ended On Time" };
   };
 
+  // NEW: hoisted out of the old one-time useEffect so both the initial
+  // load AND the periodic silent poll (below) can reuse the exact same
+  // logic. `silent` is currently unused for UI purposes (there's no
+  // loading spinner on this dashboard for it) but is kept so future
+  // loading-state UI can be added without touching call sites.
+  const loadTodayShift = async (silent = false) => {
+    if (!userId) return;
+    try {
+      const res = await fetch(`${API_URL}api/users/${userId}`);
+      const json = await res.json();
+      const user = json?.data || json;
+      // FIX: local date (see localTodayDateString above), not UTC.
+      const todayStr = localTodayDateString();
+      const todayShift = user?.shifts?.find((s) => s.date === todayStr);
+
+      if (!todayShift) {
+        // No record for today (fresh day, or not started yet) — make sure
+        // we're not stuck showing a stale "shift started" state from
+        // before (e.g. right after midnight rollover).
+        setShiftStarted(false);
+        setShiftStartTime(null);
+        setShiftEndTime(null);
+        setShiftPunctuality(null);
+        setShiftEndPunctuality(null);
+        setShiftCompletedToday(false);
+        setOnBreak(false);
+        setActiveBreakKey(null);
+        setActiveBreakStartTime(null);
+        setActiveBreakDurationSecs(0);
+        setLastBreakEndTime(null);
+        setCompletedBreaks({});
+        setBreaks({
+          break1: { used: false, duration: 15, name: "Short Break 1", icon: FaCoffee },
+          lunch: { used: false, duration: 30, name: "Lunch Break", icon: FaUtensils },
+          break2: { used: false, duration: 15, name: "Short Break 2", icon: FaCoffee }
+        });
+        setStatus("Not Started");
+        return;
+      }
+
+      // ---- Shift start ----
+      if (todayShift.shiftStart) {
+        const startDate = parseTimeStringToDate(todayShift.shiftStart);
+        setShiftStartTime((prev) => (prev && prev.getTime() === startDate.getTime() ? prev : startDate));
+        setShiftPunctuality(computeShiftStartPunctuality(startDate));
+        if (!todayShift.shiftEnd) {
+          setShiftStarted(true);
+        }
+      } else {
+        setShiftStartTime(null);
+        setShiftPunctuality(null);
+        setShiftStarted(false);
+      }
+
+      // ---- Shift end ----
+      if (todayShift.shiftEnd) {
+        const endDate = parseTimeStringToDate(todayShift.shiftEnd);
+        setShiftEndTime((prev) => (prev && prev.getTime() === endDate.getTime() ? prev : endDate));
+        setShiftEndPunctuality(computeShiftEndPunctuality(endDate));
+        setShiftStarted(false);
+        setOnBreak(false);
+        setActiveBreakKey(null);
+        setActiveBreakStartTime(null);
+        setActiveBreakDurationSecs(0);
+        setShiftCompletedToday(true);
+        setStatus("Shift Completed");
+      } else {
+        setShiftEndTime(null);
+        setShiftEndPunctuality(null);
+        setShiftCompletedToday(false);
+      }
+
+      // ---- Breaks ----
+      const serverBreaks = Array.isArray(todayShift.breaks) ? todayShift.breaks : [];
+
+      setBreaks((prev) => {
+        const updated = {
+          break1: { ...prev.break1, used: false },
+          lunch: { ...prev.lunch, used: false },
+          break2: { ...prev.break2, used: false },
+        };
+        serverBreaks.forEach((b) => {
+          if (updated[b.type]) {
+            updated[b.type] = { ...updated[b.type], used: true };
+          }
+        });
+        return updated;
+      });
+
+      const completedInit = {};
+      serverBreaks.forEach((b) => {
+        if (b.start && b.end) {
+          const startDate = parseTimeStringToDate(b.start);
+          const endDate = parseTimeStringToDate(b.end);
+          const allowedMins = b.type === "lunch" ? 30 : 15;
+          const actualMins = Math.round((endDate.getTime() - startDate.getTime()) / (1000 * 60));
+          const isOvertime = actualMins > allowedMins;
+          completedInit[b.type] = {
+            start: startDate,
+            end: endDate,
+            isOvertime,
+            overtimeMins: isOvertime ? actualMins - allowedMins : 0,
+          };
+        }
+      });
+      setCompletedBreaks(completedInit);
+
+      const ongoing = serverBreaks.find((b) => !b.end);
+
+      if (ongoing && !todayShift.shiftEnd) {
+        const startDate = parseTimeStringToDate(ongoing.start);
+        const durationMins = ongoing.type === "lunch" ? 30 : 15;
+
+        const lastHourCutoff = new Date(startDate);
+        lastHourCutoff.setHours(OFFICIAL_SHIFT_END_HOUR - 1, 0, 0, 0);
+        const secsUntilCutoffFromStart = Math.floor((lastHourCutoff.getTime() - startDate.getTime()) / 1000);
+        const cappedDurationSecs =
+          secsUntilCutoffFromStart >= 0 && secsUntilCutoffFromStart < durationMins * 60
+            ? secsUntilCutoffFromStart
+            : durationMins * 60;
+
+        // NEW: only touch these if something actually changed (a different
+        // break started, or — this is the key bit — the admin edited THIS
+        // break's start time / duration). Comparing by value before
+        // setting means a routine 5-second poll with no real change causes
+        // zero re-renders here and the countdown never jitters; but the
+        // moment the admin corrects a start time, the new value differs,
+        // React updates it, and the countdown effect above instantly
+        // recalculates the remaining time from the corrected start.
+        setActiveBreakKey((prevKey) => (prevKey === ongoing.type ? prevKey : ongoing.type));
+        setActiveBreakStartTime((prev) =>
+          prev && prev.getTime() === startDate.getTime() ? prev : startDate
+        );
+        setActiveBreakDurationSecs((prev) => (prev === cappedDurationSecs ? prev : cappedDurationSecs));
+        setOnBreak(true);
+        setStatus(`On ${ongoing.type === "lunch" ? "Lunch Break" : ongoing.type === "break1" ? "Short Break 1" : "Short Break 2"}`);
+      } else {
+        // No break currently open on the server (or the shift itself was
+        // ended by the admin). If our local UI still thinks we're on a
+        // break — e.g. the admin reset/deleted it, or ended it, from the
+        // admin panel — clear it here so the employee isn't stuck staring
+        // at a phantom countdown.
+        setOnBreak(false);
+        setActiveBreakKey(null);
+        setActiveBreakStartTime(null);
+        setActiveBreakDurationSecs(0);
+        if (todayShift.shiftStart && !todayShift.shiftEnd) {
+          setStatus("Working");
+        }
+
+        const lastEnded = [...serverBreaks].reverse().find((b) => b.end);
+        if (lastEnded) setLastBreakEndTime(parseTimeStringToDate(lastEnded.end));
+        else setLastBreakEndTime(null);
+      }
+    } catch (e) {
+      console.error("Failed to load today's shift status:", e);
+    }
+  };
+
+  useEffect(() => {
+    loadTodayShift();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId]);
+
+  // NEW: silently re-sync with the server every few seconds so any change
+  // made from the Admin Panel — edited break start/end time, a break
+  // reset, or a shift start/end override — shows up here automatically.
+  // No manual refresh needed, and if a break is currently running, an
+  // admin-side correction to its start time instantly fixes the running
+  // countdown (see the comparison logic inside loadTodayShift above).
   useEffect(() => {
     if (!userId) return;
-
-    const loadTodayShift = async () => {
-      try {
-        const res = await fetch(`${API_URL}api/users/${userId}`);
-        const json = await res.json();
-        const user = json?.data || json;
-        const todayStr = new Date().toISOString().split("T")[0];
-        const todayShift = user?.shifts?.find((s) => s.date === todayStr);
-
-        if (!todayShift) return;
-
-        if (todayShift.shiftStart) {
-          const startDate = parseTimeStringToDate(todayShift.shiftStart);
-          setShiftStartTime(startDate);
-          setShiftPunctuality(computeShiftStartPunctuality(startDate));
-          setShiftStarted(!todayShift.shiftEnd);
-          setStatus(todayShift.shiftEnd ? "Shift Completed" : "Working");
-        }
-
-        if (todayShift.shiftEnd) {
-          const endDate = parseTimeStringToDate(todayShift.shiftEnd);
-          setShiftEndTime(endDate);
-          setShiftEndPunctuality(computeShiftEndPunctuality(endDate));
-          // Today's shift is already started + ended — lock the Start button.
-          setShiftCompletedToday(true);
-        }
-
-        if (Array.isArray(todayShift.breaks) && todayShift.breaks.length > 0) {
-          setBreaks((prev) => {
-            const updated = { ...prev };
-            todayShift.breaks.forEach((b) => {
-              if (updated[b.type]) {
-                updated[b.type] = { ...updated[b.type], used: true };
-              }
-            });
-            return updated;
-          });
-
-          const completedInit = {};
-          todayShift.breaks.forEach((b) => {
-            if (b.start && b.end) {
-              const startDate = parseTimeStringToDate(b.start);
-              const endDate = parseTimeStringToDate(b.end);
-              const allowedMins = b.type === "lunch" ? 30 : 15;
-              const actualMins = Math.round((endDate.getTime() - startDate.getTime()) / (1000 * 60));
-              const isOvertime = actualMins > allowedMins;
-              completedInit[b.type] = {
-                start: startDate,
-                end: endDate,
-                isOvertime,
-                overtimeMins: isOvertime ? actualMins - allowedMins : 0,
-              };
-            }
-          });
-          setCompletedBreaks(completedInit);
-
-          const ongoing = todayShift.breaks.find((b) => !b.end);
-          if (ongoing) {
-            const startDate = parseTimeStringToDate(ongoing.start);
-            const durationMins = ongoing.type === "lunch" ? 30 : 15;
-
-            const lastHourCutoff = new Date(startDate);
-            lastHourCutoff.setHours(OFFICIAL_SHIFT_END_HOUR - 1, 0, 0, 0);
-            const secsUntilCutoffFromStart = Math.floor((lastHourCutoff.getTime() - startDate.getTime()) / 1000);
-            const cappedDurationSecs =
-              secsUntilCutoffFromStart >= 0 && secsUntilCutoffFromStart < durationMins * 60
-                ? secsUntilCutoffFromStart
-                : durationMins * 60;
-
-            setActiveBreakKey(ongoing.type);
-            setActiveBreakStartTime(startDate);
-            setActiveBreakDurationSecs(cappedDurationSecs); // NEW: drives the recalculating effect above
-            // Initial value — the effect above will immediately recompute
-            // this from Date.now() anyway, this is just to avoid a 0/blank flash.
-            const elapsedSecs = Math.floor((new Date().getTime() - startDate.getTime()) / 1000);
-            setBreakTimeRemaining(cappedDurationSecs - elapsedSecs);
-            setOnBreak(true);
-            setStatus(`On ${ongoing.type === "lunch" ? "Lunch Break" : ongoing.type === "break1" ? "Short Break 1" : "Short Break 2"}`);
-          } else {
-            const lastEnded = [...todayShift.breaks].reverse().find((b) => b.end);
-            if (lastEnded) setLastBreakEndTime(parseTimeStringToDate(lastEnded.end));
-          }
-        }
-      } catch (e) {
-        console.error("Failed to load today's shift status:", e);
-      }
-    };
-
-    loadTodayShift();
+    const pollInterval = setInterval(() => {
+      loadTodayShift(true);
+    }, 5000);
+    return () => clearInterval(pollInterval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId]);
 

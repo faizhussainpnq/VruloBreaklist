@@ -15,7 +15,11 @@ import {
   FaEye,
   FaEyeSlash,
   FaCheckCircle,
-  FaRedo
+  FaRedo,
+  FaMugHot,
+  FaUndo,
+  FaSave,
+  FaBan
 } from "react-icons/fa";
 import StarBackground from "../components/StarBackground";
 import Navbar from "../components/Navbar";
@@ -27,8 +31,23 @@ import {
   getBreakStatus,
   findShiftByDate,
   todayDateString,
-  formatCountdown
-} from "../utils/ShiftUtils";
+  formatCountdown,
+  getEffectiveAllowedMinutes,
+  parseTimeToMinutes,
+  formatMinutes,
+  EXPECTED_SHIFT_END,
+} from "../utils/ShiftUtils.js";
+
+// If your break-manage routes (PUT/DELETE /break/:id/:breakId) are mounted
+// under a different prefix than the other break routes, change ONLY this
+// constant — everything else in BreakManageModal uses it automatically.
+const BREAK_MANAGE_API_PREFIX = "api/shifts/break";
+
+const BREAK_TYPE_LABELS = {
+  break1: "Short Break 1",
+  lunch: "Lunch Break",
+  break2: "Short Break 2",
+};
 
 // NEW: Reusable spinning-ring loader. Pass `size` (px) and optional className
 // for color (uses currentColor so parent text-color controls it).
@@ -126,6 +145,470 @@ const ActionOverlay = ({ show, label = "Working on it...", darkMode }) => (
   </AnimatePresence>
 );
 
+// NEW: Small, styled confirmation modal — replaces the browser's ugly
+// native window.confirm() for resetting a break. Matches the rest of the
+// app's design language (rounded corners, dark/light aware, amber/rose
+// accents) instead of a jarring OS-native popup.
+const ConfirmModal = ({ open, title, message, confirmLabel, onConfirm, onCancel, darkMode, danger = true }) => (
+  <AnimatePresence>
+    {open && (
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-md"
+        onClick={onCancel}
+      >
+        <motion.div
+          initial={{ opacity: 0, scale: 0.92, y: 10 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          exit={{ opacity: 0, scale: 0.92, y: 10 }}
+          onClick={(e) => e.stopPropagation()}
+          className={`w-full max-w-sm rounded-3xl border shadow-2xl p-6 ${
+            darkMode ? "bg-slate-900 border-slate-800 text-white" : "bg-white border-slate-300 text-slate-900"
+          }`}
+        >
+          <div className="flex items-start gap-3 mb-4">
+            <div className={`shrink-0 w-10 h-10 rounded-2xl flex items-center justify-center ${
+              danger
+                ? (darkMode ? "bg-rose-500/15 text-rose-400" : "bg-rose-100 text-rose-600")
+                : (darkMode ? "bg-amber-500/15 text-amber-400" : "bg-amber-100 text-amber-600")
+            }`}>
+              <FaExclamationTriangle />
+            </div>
+            <div>
+              <h3 className="font-extrabold text-base leading-tight">{title}</h3>
+              <p className={`text-xs mt-1 leading-relaxed ${darkMode ? "text-slate-400" : "text-slate-600"}`}>
+                {message}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-3">
+            <button
+              type="button"
+              onClick={onCancel}
+              className={`px-4 py-2 rounded-xl text-xs font-bold cursor-pointer transition-colors ${
+                darkMode ? "text-slate-400 hover:bg-slate-800" : "text-slate-600 hover:bg-slate-100"
+              }`}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={onConfirm}
+              className={`px-4 py-2 rounded-xl text-xs font-bold cursor-pointer transition-all shadow-lg ${
+                danger
+                  ? "bg-rose-600 hover:bg-rose-500 text-white shadow-rose-600/20"
+                  : "bg-amber-400 hover:bg-amber-300 text-slate-950 shadow-amber-500/20"
+              }`}
+            >
+              {confirmLabel}
+            </button>
+          </div>
+        </motion.div>
+      </motion.div>
+    )}
+  </AnimatePresence>
+);
+
+// ---------------------------------------------------------------------
+// NEW: Break Management Modal (the "chai cup" modal)
+// ---------------------------------------------------------------------
+// Shows every break taken TODAY by the given employee, calculated straight
+// from the DB record (shift.breaks), flags any break that ran over its
+// allowed limit (15 min for break1/break2, 30 min for lunch, cutoff-aware
+// via getEffectiveAllowedMinutes so it matches the rest of the app) in red
+// with the exact rule that was broken, and lets the admin:
+//   - Edit a break's start/end time (e.g. fix a few seconds of network lag)
+//   - Reset (delete) a break entirely so the employee can take it again
+//     from their own dashboard (useful when they accidentally ended it
+//     seconds after starting it)
+function BreakManageModal({ open, onClose, darkMode, employee, apiUrl, onUpdated }) {
+  // Local copy of today's shift so the modal can update instantly after an
+  // edit/reset without waiting for the parent's 5s poll cycle.
+  const [shift, setShift] = useState(null);
+  const [editingBreakId, setEditingBreakId] = useState(null);
+  const [editStart, setEditStart] = useState("");
+  const [editEnd, setEditEnd] = useState("");
+  const [savingId, setSavingId] = useState(null);
+  const [deletingId, setDeletingId] = useState(null);
+  const [localError, setLocalError] = useState("");
+
+  // NEW: which break (if any) is pending a reset confirmation. Replaces
+  // window.confirm() with the styled ConfirmModal above.
+  const [pendingResetBreak, setPendingResetBreak] = useState(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const today = todayDateString();
+    setShift(findShiftByDate(employee?.shifts, today));
+    setEditingBreakId(null);
+    setLocalError("");
+    setPendingResetBreak(null);
+  }, [open, employee]);
+
+  if (!open) return null;
+
+  const userId = employee?.id;
+  const shiftId = shift?._id;
+  const breaks = Array.isArray(shift?.breaks) ? shift.breaks : [];
+
+  const computeRow = (b) => {
+    const allowedMinutes = getEffectiveAllowedMinutes(b, shift?.shiftEnd || EXPECTED_SHIFT_END);
+    let durationMinutes = null;
+    let isOver = false;
+    let overByMinutes = 0;
+
+    if (b.start && b.end) {
+      const s = parseTimeToMinutes(b.start);
+      const e = parseTimeToMinutes(b.end);
+      if (s !== null && e !== null) {
+        let dur = e - s;
+        if (dur < 0) dur += 24 * 60;
+        durationMinutes = dur;
+        isOver = dur > allowedMinutes;
+        overByMinutes = isOver ? dur - allowedMinutes : 0;
+      }
+    }
+
+    return { allowedMinutes, durationMinutes, isOver, overByMinutes };
+  };
+
+  const startEdit = (b) => {
+    setLocalError("");
+    setEditingBreakId(b._id);
+    setEditStart(b.start || "");
+    setEditEnd(b.end || "");
+  };
+
+  const cancelEdit = () => {
+    setEditingBreakId(null);
+    setLocalError("");
+  };
+
+  const saveEdit = async (b) => {
+    setLocalError("");
+
+    if (!editStart.trim()) {
+      setLocalError("Start time is required.");
+      return;
+    }
+    if (parseTimeToMinutes(editStart.trim()) === null) {
+      setLocalError('Start time must look like "03:05 PM" (or "03:05:30 PM").');
+      return;
+    }
+    if (editEnd.trim() && parseTimeToMinutes(editEnd.trim()) === null) {
+      setLocalError('End time must look like "03:20 PM" (or leave it blank for an ongoing break).');
+      return;
+    }
+    if (!shiftId) {
+      setLocalError("Couldn't find today's shift record. Try refreshing.");
+      return;
+    }
+
+    try {
+      setSavingId(b._id);
+      const res = await fetch(`${apiUrl}${BREAK_MANAGE_API_PREFIX}/${userId}/${b._id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          shiftId,
+          start: editStart.trim(),
+          end: editEnd.trim(), // empty string clears the end time (reopens the break)
+        }),
+      });
+
+      let data = {};
+      try {
+        data = await res.json();
+      } catch {
+        throw new Error("Server sent an invalid response.");
+      }
+
+      if (!res.ok) {
+        throw new Error(data.message || `Update failed (${res.status})`);
+      }
+
+      const updatedUser = data.data || data.user || data;
+      const updatedShift = findShiftByDate(updatedUser?.shifts, todayDateString());
+      setShift(updatedShift || shift);
+      setEditingBreakId(null);
+
+      // Silently refresh the main table in the background too.
+      onUpdated?.(true);
+    } catch (err) {
+      console.error("UPDATE BREAK ERROR:", err);
+      setLocalError(err?.message || "Couldn't save this break. Please try again.");
+    } finally {
+      setSavingId(null);
+    }
+  };
+
+  // NEW: this just opens the styled confirmation modal now, instead of
+  // running window.confirm() directly. The actual reset logic moved to
+  // performResetBreak() below, which the modal's "Reset Break" button calls.
+  const requestResetBreak = (b) => {
+    if (!shiftId) {
+      setLocalError("Couldn't find today's shift record. Try refreshing.");
+      return;
+    }
+    setLocalError("");
+    setPendingResetBreak(b);
+  };
+
+  const performResetBreak = async () => {
+    const b = pendingResetBreak;
+    if (!b) return;
+    setPendingResetBreak(null);
+
+    try {
+      setDeletingId(b._id);
+      setLocalError("");
+
+      const res = await fetch(`${apiUrl}${BREAK_MANAGE_API_PREFIX}/${userId}/${b._id}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ shiftId }),
+      });
+
+      let data = {};
+      try {
+        data = await res.json();
+      } catch {
+        // some delete endpoints return no body — that's fine
+      }
+
+      if (!res.ok) {
+        throw new Error(data.message || `Reset failed (${res.status})`);
+      }
+
+      const updatedUser = data.data || data.user || data;
+      const updatedShift = findShiftByDate(updatedUser?.shifts, todayDateString());
+      setShift(
+        updatedShift || {
+          ...shift,
+          breaks: breaks.filter((x) => x._id !== b._id),
+        }
+      );
+
+      onUpdated?.(true);
+    } catch (err) {
+      console.error("DELETE BREAK ERROR:", err);
+      setLocalError(err?.message || "Couldn't reset this break. Please try again.");
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const pendingLabel = pendingResetBreak ? (BREAK_TYPE_LABELS[pendingResetBreak.type] || pendingResetBreak.type) : "";
+
+  return (
+    <>
+      <AnimatePresence>
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="fixed inset-0 z-[90] flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-md"
+          onClick={onClose}
+        >
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.95, y: 10 }}
+            onClick={(e) => e.stopPropagation()}
+            className={`w-full max-w-2xl max-h-[85vh] overflow-hidden rounded-3xl border shadow-2xl flex flex-col ${
+              darkMode ? "bg-slate-950 border-slate-800 text-slate-100" : "bg-white border-slate-200 text-slate-900"
+            }`}
+          >
+            <div className={`flex items-center justify-between px-6 py-4 border-b shrink-0 ${darkMode ? "border-slate-800" : "border-slate-200"}`}>
+              <h2 className="text-lg font-extrabold flex items-center gap-2">
+                <FaMugHot className={darkMode ? "text-amber-400" : "text-amber-600"} />
+                Today's Breaks — {employee?.name}
+              </h2>
+              <button
+                type="button"
+                onClick={onClose}
+                className={`p-2 rounded-xl transition-colors cursor-pointer ${darkMode ? "hover:bg-slate-800 text-slate-400" : "hover:bg-slate-100 text-slate-500"}`}
+              >
+                <FaTimes />
+              </button>
+            </div>
+
+            <div className="flex-1 min-h-0 overflow-y-auto px-6 py-4 space-y-3">
+              {!shift && (
+                <p className="text-sm opacity-70">No shift found for today — employee hasn't started their shift yet.</p>
+              )}
+
+              {shift && breaks.length === 0 && (
+                <p className="text-sm opacity-70">No breaks taken yet today.</p>
+              )}
+
+              {localError && (
+                <div className={`text-xs font-bold px-3 py-2 rounded-xl border flex items-center gap-2 ${
+                  darkMode ? "bg-rose-600/20 border-rose-500/40 text-rose-300" : "bg-rose-100 border-rose-300 text-rose-700"
+                }`}>
+                  <FaExclamationTriangle className="shrink-0" /> {localError}
+                </div>
+              )}
+
+              {breaks.map((b) => {
+                const { allowedMinutes, durationMinutes, isOver, overByMinutes } = computeRow(b);
+                const label = BREAK_TYPE_LABELS[b.type] || b.type;
+                const isEditing = editingBreakId === b._id;
+                const isSaving = savingId === b._id;
+                const isDeleting = deletingId === b._id;
+                const ongoing = Boolean(b.start && !b.end);
+
+                return (
+                  <div
+                    key={b._id}
+                    className={`border rounded-2xl p-4 ${
+                      isOver
+                        ? (darkMode ? "bg-rose-950/40 border-rose-600/50" : "bg-rose-50 border-rose-300")
+                        : ongoing
+                          ? (darkMode ? "bg-amber-950/20 border-amber-600/40" : "bg-amber-50 border-amber-300")
+                          : (darkMode ? "bg-slate-900/50 border-slate-800" : "bg-slate-50 border-slate-200")
+                    }`}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                      <span className="font-bold text-sm flex items-center gap-2">
+                        <FaMugHot className={darkMode ? "text-amber-400" : "text-amber-600"} />
+                        {label}
+                      </span>
+                      <span className={`text-[11px] font-extrabold px-2.5 py-1 rounded-full ${
+                        isOver
+                          ? (darkMode ? "bg-rose-500/20 text-rose-400" : "bg-rose-100 text-rose-700")
+                          : ongoing
+                            ? (darkMode ? "bg-amber-500/20 text-amber-400" : "bg-amber-100 text-amber-700")
+                            : (darkMode ? "bg-emerald-500/20 text-emerald-400" : "bg-emerald-100 text-emerald-700")
+                      }`}>
+                        {isOver ? "Rule Broken" : ongoing ? "Ongoing" : "Within Limit"}
+                      </span>
+                    </div>
+
+                    {!isEditing ? (
+                      <>
+                        <div className="grid sm:grid-cols-3 gap-3 text-xs mb-2">
+                          <div>
+                            <p className="uppercase font-semibold opacity-60 mb-0.5">Start</p>
+                            <p className="font-mono font-bold">{b.start || "—"}</p>
+                          </div>
+                          <div>
+                            <p className="uppercase font-semibold opacity-60 mb-0.5">End</p>
+                            <p className="font-mono font-bold">{b.end || (ongoing ? "In progress" : "—")}</p>
+                          </div>
+                          <div>
+                            <p className="uppercase font-semibold opacity-60 mb-0.5">Duration / Limit</p>
+                            <p className="font-mono font-bold">
+                              {durationMinutes !== null ? formatMinutes(durationMinutes) : "—"} / {formatMinutes(allowedMinutes)}
+                            </p>
+                          </div>
+                        </div>
+
+                        {isOver && (
+                          <div className={`text-xs font-bold flex items-center gap-1.5 mb-3 ${darkMode ? "text-rose-300" : "text-rose-700"}`}>
+                            <FaExclamationTriangle />
+                            Rule Broken — took {formatMinutes(durationMinutes)}, allowed {formatMinutes(allowedMinutes)} (over by {formatMinutes(overByMinutes)})
+                          </div>
+                        )}
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => startEdit(b)}
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-colors ${
+                              darkMode ? "bg-slate-800 hover:bg-slate-700 text-amber-400" : "bg-slate-200 hover:bg-slate-300 text-amber-700"
+                            }`}
+                          >
+                            <FaEdit /> Edit Time
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isDeleting}
+                            onClick={() => requestResetBreak(b)}
+                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-rose-600 hover:bg-rose-500 text-white cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                          >
+                            {isDeleting ? <Spinner size={12} /> : <FaUndo />}
+                            {isDeleting ? "Resetting..." : "Reset Break"}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="space-y-3">
+                        <div className="grid sm:grid-cols-2 gap-3 text-xs">
+                          <div>
+                            <label className="block mb-1 font-bold opacity-70">Start Time</label>
+                            <input
+                              type="text"
+                              value={editStart}
+                              onChange={(e) => setEditStart(e.target.value)}
+                              placeholder="e.g. 03:05 PM"
+                              className={`w-full p-2 rounded-lg border font-mono font-bold text-xs ${
+                                darkMode ? "bg-slate-950 border-slate-700 text-amber-400" : "bg-white border-slate-300 text-amber-700"
+                              }`}
+                            />
+                          </div>
+                          <div>
+                            <label className="block mb-1 font-bold opacity-70">End Time (blank = ongoing)</label>
+                            <input
+                              type="text"
+                              value={editEnd}
+                              onChange={(e) => setEditEnd(e.target.value)}
+                              placeholder="e.g. 03:20 PM"
+                              className={`w-full p-2 rounded-lg border font-mono font-bold text-xs ${
+                                darkMode ? "bg-slate-950 border-slate-700 text-amber-400" : "bg-white border-slate-300 text-amber-700"
+                              }`}
+                            />
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={isSaving}
+                            onClick={() => saveEdit(b)}
+                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-amber-400 hover:bg-amber-300 text-slate-950 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                          >
+                            {isSaving ? <Spinner size={12} /> : <FaSave />}
+                            {isSaving ? "Saving..." : "Save"}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isSaving}
+                            onClick={cancelEdit}
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer disabled:opacity-50 transition-colors ${
+                              darkMode ? "bg-slate-800 hover:bg-slate-700 text-slate-300" : "bg-slate-200 hover:bg-slate-300 text-slate-700"
+                            }`}
+                          >
+                            <FaBan /> Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </motion.div>
+        </motion.div>
+      </AnimatePresence>
+
+      {/* NEW: styled reset confirmation, replacing window.confirm() */}
+      <ConfirmModal
+        open={Boolean(pendingResetBreak)}
+        title={`Reset "${pendingLabel}"?`}
+        message={`This deletes today's record for this break for ${employee?.name}, so they can take it again from their own dashboard. This can't be undone.`}
+        confirmLabel="Reset Break"
+        onConfirm={performResetBreak}
+        onCancel={() => setPendingResetBreak(null)}
+        darkMode={darkMode}
+        danger
+      />
+    </>
+  );
+}
+
 export default function AdminDashboard() {
   const navigate = useNavigate();
 
@@ -140,6 +623,9 @@ export default function AdminDashboard() {
   const [isRegisterModalOpen, setIsRegisterModalOpen] = useState(false);
   const [showViolationsModal, setShowViolationsModal] = useState(false);
   const [historyEmployee, setHistoryEmployee] = useState(null);
+
+  // NEW: Break management modal (the "chai cup" icon)
+  const [breakManageEmployee, setBreakManageEmployee] = useState(null);
 
   // Password visibility state for Register Modal
   const [showPassword, setShowPassword] = useState(false);
@@ -171,7 +657,7 @@ export default function AdminDashboard() {
     violations: 0
   });
 
-  const API_URL = (import.meta.env.VITE_API_URL || "https://vrulobreaklist-1.onrender.com/")
+  const API_URL = (import.meta.env.VITE_API_URL || "http://localhost:5000/")
 
   // Ticks every second so "on break" shows a live running countdown and
   // today's violations stay current, without needing a page refresh.
@@ -968,6 +1454,14 @@ export default function AdminDashboard() {
                       </td>
                       
                       <td className="py-4 px-3 text-right space-x-2">
+                        {/* NEW: chai-cup icon — opens the Break Management modal */}
+                        <button
+                          onClick={() => setBreakManageEmployee(emp)}
+                          className="p-2 text-amber-500 hover:bg-amber-500/10 rounded-lg transition-all cursor-pointer"
+                          title="Manage Today's Breaks"
+                        >
+                          <FaMugHot />
+                        </button>
                         <button
                           onClick={() => setEditingEmployee(emp)}
                           className="p-2 text-amber-500 hover:bg-amber-500/10 rounded-lg transition-all cursor-pointer"
@@ -1249,6 +1743,16 @@ export default function AdminDashboard() {
         darkMode={darkMode}
         employee={historyEmployee}
         month={selectedMonth}
+      />
+
+      {/* NEW: Break Management Modal — the "chai cup" modal */}
+      <BreakManageModal
+        open={Boolean(breakManageEmployee)}
+        onClose={() => setBreakManageEmployee(null)}
+        darkMode={darkMode}
+        employee={breakManageEmployee}
+        apiUrl={API_URL}
+        onUpdated={getUsers}
       />
     </div>
   );
