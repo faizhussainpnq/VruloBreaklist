@@ -17,7 +17,7 @@ import {
 import StarBackground from "../components/StarBackground";
 import Navbar from "../components/Navbar";
 
-const API_URL = import.meta.env.VITE_API_URL || "https://vrulobreaklist-1.onrender.com//";
+const API_URL = import.meta.env.VITE_API_URL || "https://vrulobreaklist.onrender.com/";
 
 const BREAK_LABELS = {
   break1: "Short Break 1",
